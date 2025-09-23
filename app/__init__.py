@@ -10,7 +10,7 @@ from app.routes.project_routes import project_router
 from app.routes.project_routes import testcase_route
 from app.routes.frd_workflow_router import frd_router
 from app.routes.brd_workflow_route import brd_router
-# from app.routes.stream_test_route import strm_route
+from app.routes.stream_test_route import strm_route
 
 
 from app.routes.test_streaming_routers import test_streaming_router
@@ -89,8 +89,8 @@ def create_app():
     app.include_router(extraction_router, prefix=f"{api_prefix}/project", tags=["Content"])
     app.include_router(frd_router, prefix=f"{api_prefix}", tags=["FRD Flow"])
     app.include_router(brd_router, prefix=f"{api_prefix}", tags=["BRD Flow"])
-    # app.include_router(strm_route)
+    app.include_router(strm_route)
 
-    # app.include_router(test_streaming_router, prefix=f"{api_prefix}", tags=["FRD Stream"])
-    # app.include_router(brd_stream_router, prefix=f"{api_prefix}", tags=["BRD Stream"])
+    app.include_router(test_streaming_router, prefix=f"{api_prefix}", tags=["FRD Stream"])
+    app.include_router(brd_stream_router, prefix=f"{api_prefix}", tags=["BRD Stream"])
     return app

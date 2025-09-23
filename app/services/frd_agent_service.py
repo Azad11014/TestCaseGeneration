@@ -318,22 +318,15 @@ class FRDAgentService:
             raise HTTPException(status_code=500, detail=f"Something went wrong in apply fix: {e}")
 
     # ---------------- Streaming map-reduce SSE generator ----------------
-    async def analyze_frd_mapreduce_stream(
-    self, db: AsyncSession, document_id: int, model: str | None = None
-):
-        """
-        Return an async generator that streams FRD analysis tokens.
-        """
+    async def analyze_frd_mapreduce_stream(self, db: AsyncSession, document_id: int, model: str | None = None):
         doc = await db.get(Documents, document_id)
-        # if not doc or doc.doctype != DocType.FRD:
-        #     raise HTTPException(status_code=404, detail="FRD document not found")
+        if not doc or self._doctype_value(doc) != DocType.FRD.value:
+            raise HTTPException(status_code=404, detail="FRD document not found")
 
         text = await self._load_document_text(doc)
-        chunks = self.extractor._split_into_token_chunks(
-            text, max_tokens=2000, overlap_tokens=200
-        )
+        chunks = self.extractor._split_into_token_chunks(text, max_tokens=2000, overlap_tokens=200)
 
-        # Create initial DB row
+        # Create initial row
         row = FRDVersions(
             frd_id=document_id,
             changes={"streaming": True},
@@ -343,25 +336,40 @@ class FRDAgentService:
         await db.commit()
         await db.refresh(row)
 
-        async def event_generator():
-            for i, chunk in enumerate(chunks):
-                async for token in self.ai._groq_chat_stream(
-                    [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a senior QA analyst. "
-                                "Analyze the FRD chunk and explain issues clearly."
-                            ),
-                        },
-                        {"role": "user", "content": f"FRD Chunk {i}:\n{chunk}"},
-                    ],
-                    model=model or "llama-3.1-8b-instant",
-                    temperature=0.2,
-                    timeout=120,
-                ):
-                    yield token
+        merged_anomalies = []
+        anomaly_counter = 1
 
-            yield f"\n\n[Analysis complete. Version ID: {row.id}]\n"
+        for idx, chunk in enumerate(chunks):
+            sys = {"role": "system", "content": "You are a senior QA analyst. Extract anomalies from this FRD chunk."}
+            usr = {"role": "user", "content": (
+                "Return strict JSON: "
+                '{ "anomalies": [ {"section": str, "issue": str, '
+                '"severity": "low|medium|high", "suggestion": str } ] }\n\n'
+                f"FRD Chunk {idx+1}:\n{chunk}"
+            )}
 
-        return event_generator()  # ✅ returns an async generator (coroutine is awaited in endpoint)
+            resp = await self.ai.chat([sys, usr], provider="groq", response_format_json=True)
+            try:
+                parsed = json.loads(resp) if isinstance(resp, str) else resp
+            except Exception:
+                parsed = {"anomalies": []}
+
+            for a in parsed.get("anomalies", []):
+                a["id"] = anomaly_counter
+                anomaly_counter += 1
+                merged_anomalies.append(a)
+
+        # Save anomalies **before streaming**
+        row.changes = {"anomalies": merged_anomalies}
+        await db.commit()
+        await db.refresh(row)
+
+        payload = {
+            "version_id": row.id,
+            "anomalies": merged_anomalies
+        }
+
+        async def generator():
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        return generator()

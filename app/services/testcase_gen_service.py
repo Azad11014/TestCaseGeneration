@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Dict, Any
 from sqlalchemy import select, desc
 
-from app.schema.schema import TestCaseUpdateRequest
+from app.schema.schema import TestCaseChatRequest, TestCaseUpdateRequest
 from app.services.ai_client_services import AiClientService
 from app.services.content_extraction_service import ContentExtractionService
 from app.services.frd_agent_service import FRDAgentService
@@ -118,7 +118,7 @@ class TestGenServies:
 
 
     async def write_and_record(
-    self, db: AsyncSession, document_id: int, testcases: List[dict], status, version: int
+    self, db: AsyncSession, document_id: int, testcases: List[dict], status, version: int | None = None
 ):
         """
         Persist testcases to disk and create a Testcases DB row.
@@ -386,44 +386,50 @@ class TestGenServies:
 
 
     async def generate_testcases_stream(
-        self,
-        db: AsyncSession,
-        document_id: int,
-        ai_client: AiClientService,
-        content_extractor: ContentExtractionService,
-        max_tokens_per_chunk: int = 1800,
-    ):
+    self,
+    db: AsyncSession,
+    document_id: int,
+    ai_client: AiClientService,
+    content_extractor: ContentExtractionService,
+    max_tokens_per_chunk: int = 1800,
+):
+        """
+        Stream testcases per chunk as SSE events,
+        optionally including applied fixes from FRD content.
+        """
         try:
-            """
-            Stream testcases per chunk as SSE events,
-            send final JSON testcases at the end.
-            """
-            # load doc
+            # Load document
             doc = await db.get(Documents, document_id)
             if not doc:
                 raise HTTPException(status_code=404, detail="Document not found")
 
-            content_bytes = Path(doc.file_path).read_bytes()
-            ext = Path(doc.file_path).suffix.lower()
-            full_text = await content_extractor.extract_text_content(content_bytes, ext)
+            # Load current content including applied fixes if available
+            path = Path(doc.file_path)
+            if path.exists():
+                current_content = await content_extractor.extract_text_content(path.read_bytes(), path.suffix.lower())
+            else:
+                current_content = ""
 
-            chunks = content_extractor._split_into_token_chunks(full_text, max_tokens=max_tokens_per_chunk)
+            # Split into chunks
+            chunks = content_extractor._split_into_token_chunks(
+                current_content, max_tokens=max_tokens_per_chunk
+            )
             total_chunks = len(chunks)
-            aggregated_testcases: List[dict] = []
+            aggregated_testcases: list[dict] = []
 
             async def gen():
-                # initial event
-                yield f"data: Processing document {document_id} in {total_chunks} chunks\n\n"
-
-                aggregated_testcases = []
+                # Initial event
+                yield f"data: {json.dumps({'type':'start','document_id':document_id,'total_chunks':total_chunks})}\n\n"
 
                 for i, chunk in enumerate(chunks, start=1):
-                    yield f"data: Starting chunk {i}/{total_chunks}\n\n"
+                    yield f"data: {json.dumps({'type':'chunk_start','chunk':i})}\n\n"
 
+                    # Prepare system/user messages for LLM
                     sys = {
                         "role": "system",
                         "content": (
                             "You are a QA automation lead. Generate thorough test cases. "
+                            "Consider applied fixes in FRD content if present. "
                             "Output only JSON like this:\n"
                             "{ \"testcases\": [ {\"id\": \"TC-001\", \"title\": str, \"preconditions\": [str], "
                             "\"steps\": [str], \"expected\": str, \"priority\": \"P0|P1|P2\"} ] }"
@@ -431,51 +437,53 @@ class TestGenServies:
                     }
                     usr = {"role": "user", "content": f"Document chunk {i}/{total_chunks}:\n\n{chunk}"}
 
+                    # Stream AI response
                     stream_gen = await ai_client.stream_chat([sys, usr])
-                    # Collect the whole chunk output (not token by token)
+
                     chunk_buf = ""
                     async for part in stream_gen:
-                        if isinstance(part, dict):
-                            token_piece = part.get("text") or part.get("_raw") or json.dumps(part)
-                        else:
-                            token_piece = str(part)
+                        token_piece = part.get("text") if isinstance(part, dict) else str(part)
+                        # Stream token by token
+                        yield f"data: {json.dumps({'type':'token','chunk':i,'text':token_piece})}\n\n"
                         chunk_buf += token_piece
 
-                    # Parse JSON out of chunk_buf
+                    # Parse testcases JSON from chunk buffer
                     testcases = self._parse_testcases_from_text(chunk_buf)
 
-                    # Store into DB
-                    new_version_id = await self.write_and_record(db, document_id, testcases, status=TestCaseStatus.generated)
+                    # Store in DB
+                    new_version_id = await self.write_and_record(
+                        db, document_id, testcases, status=TestCaseStatus.generated
+                    )
                     aggregated_testcases.extend(testcases)
 
-                    yield f"data: {json.dumps({'status':'chunk_done','chunk': i,'version_id': new_version_id})}\n\n"
-                    # testcases = self._extract_json_testcases(chunk_buf)
-                    # version_id = await self.write_and_record(db, document_id, testcases, TestCaseStatus.generated)
-                    # aggregated_testcases.extend(testcases)
-                    # yield f"data: Completed chunk {i} with {len(testcases)} testcases, version_id={version_id}\n\n"
+                    yield f"data: {json.dumps({'type':'chunk_done','chunk':i,'version_id':new_version_id,'testcases_count':len(testcases)})}\n\n"
 
-                # all chunks done — send final JSON testcases
-                final_payload = {"testcases": aggregated_testcases}
-                # yield f"data: {json.dumps(final_payload, ensure_ascii=False)}\n\n"
-                # yield "data: [DONE]\n\n"
-                yield f"data: {json.dumps({'status':'complete','total_testcases': len(aggregated_testcases),'testcases': aggregated_testcases})}\n\n"
+                # Final event with all aggregated testcases
+                final_payload = {
+                    'type': 'complete',
+                    'document_id': document_id,
+                    'total_testcases': len(aggregated_testcases),
+                    'testcases': aggregated_testcases
+                }
+                yield f"data: {json.dumps(final_payload, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
 
             return gen()
-        except HTTPException as he:
-            raise 
+
+        except HTTPException:
+            raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Something went wrong in chat update : {e}")
-        
+            raise HTTPException(status_code=500, detail=f"Something went wrong in generate_testcases_stream: {e}")
+
     # --------------------chat update stream-------------------------------------------
     async def chat_update_stream(
     self, db: AsyncSession, document_id: int, request: TestCaseUpdateRequest, model: str | None = None
 ):
+        """
+        Streams AI updates to testcases per user request as SSE,
+        structured JSON events for easy frontend parsing.
+        """
         try:
-            """
-            Streams AI updates to testcases per user request as SSE,
-            like generate_testcases_stream.
-            """
             latest = await self.get_latest_row(db, document_id)
             if not latest:
                 raise HTTPException(status_code=404, detail="No testcases generated yet")
@@ -487,8 +495,8 @@ class TestGenServies:
                 "content": (
                     "You are a QA copilot. Modify ONLY the necessary parts of the testcases per user request. "
                     "Preserve all other testcases unchanged. Output only JSON like this:\n"
-                            "{ \"testcases\": [ {\"id\": \"TC-001\", \"title\": str, \"preconditions\": [str], "
-                            "\"steps\": [str], \"expected\": str, \"priority\": \"P0|P1|P2\"} ] }"
+                    "{ \"testcases\": [ {\"id\": \"TC-001\", \"title\": str, \"preconditions\": [str], "
+                    "\"steps\": [str], \"expected\": str, \"priority\": \"P0|P1|P2\"} ] }"
                 ),
             }
 
@@ -498,8 +506,7 @@ class TestGenServies:
             }
 
             async def gen():
-                # initial event
-                yield f"data: Processing chat update for document {document_id}\n\n"
+                yield f"data: {json.dumps({'type':'start','document_id':document_id,'action':'chat_update'})}\n\n"
 
                 chunk_buf = ""
                 async for token in self.ai._groq_chat_stream(
@@ -508,41 +515,33 @@ class TestGenServies:
                     temperature=0.2,
                     timeout=120,
                 ):
-                    if isinstance(token, dict):
-                        token_piece = token.get("text") or token.get("_raw") or json.dumps(token)
-                    else:
-                        token_piece = str(token)
-
+                    token_piece = token.get("text") if isinstance(token, dict) else str(token)
                     chunk_buf += token_piece
-                    # stream each token to client
-                    yield f"data: {token_piece}\n\n"
-                    
+                    # stream token
+                    yield f"data: {json.dumps({'type':'token','text':token_piece})}\n\n"
 
-                # after streaming, parse JSON from buffer
                 updated_testcases = self._parse_testcases_from_text(chunk_buf)
 
-                # store into DB
                 new_version_id = await self.write_and_record(
                     db, document_id, updated_testcases, status=TestCaseStatus.updated
                 )
 
-                # send final payload
+                # Final event
                 final_payload = {
-                    "status": "complete",
+                    "type": "complete",
+                    "document_id": document_id,
                     "version_id": new_version_id,
                     "total_testcases": len(updated_testcases),
                     "testcases": updated_testcases,
                 }
-                yield f"data: {json.dumps({'status':'complete','version_id': new_version_id,'total_testcases': len(updated_testcases)})}\n\n"
-                yield f"data: {json.dumps(updated_testcases,)}\n\n"
+                yield f"data: {json.dumps(final_payload, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
 
             return gen()
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Something went wrong in chat update stream : {e}")
-
+            raise HTTPException(status_code=500, detail=f"Something went wrong in chat_update_stream: {e}")
 
 
 
@@ -562,3 +561,49 @@ class TestGenServies:
     #         "count": len(data.get("testcases", [])),
     #         "status": "generated"
     #     }
+    async def chat_update_testcase_stream(
+        self,
+        db: AsyncSession,
+        testcase_id: int,
+        request: TestCaseChatRequest,
+        model: str | None = None
+    ):
+        # 1. Fetch testcase from DB
+        testcase = await db.get(Testcases, testcase_id)
+        if not testcase:
+            raise HTTPException(status_code=404, detail="Testcase not found")
+        
+        current_data = json.loads(Path(testcase.file_path).read_text(encoding="utf-8"))
+
+        # 2. Prepare system/user messages for LLM
+        sys = {
+            "role": "system",
+            "content": "You are a QA assistant. Modify only the parts needed according to user instructions. Output strict JSON."
+        }
+        usr = {
+            "role": "user",
+            "content": f"User message: {request.message}\nCurrent testcase JSON:\n{json.dumps(current_data, indent=2)}"
+        }
+
+        async def gen():
+            buf = ""
+            async for token in self.ai._groq_chat_stream([sys, usr], model=model or "llama-3.1-8b-instant",
+                    temperature=0.2,
+                    timeout=120,):
+                token_piece = token.get("text") if isinstance(token, dict) else str(token)
+                buf += token_piece
+                yield f"data: {json.dumps({'type':'token','text':token_piece})}\n\n"
+
+            # parse final JSON
+            updated_testcase = self._parse_testcases_from_text(buf)
+
+            # save new version
+            new_version_id = await self.write_and_record(
+                db, testcase.document_id, updated_testcase, status=TestCaseStatus.updated
+            )
+
+            # final payload
+            yield f"data: {json.dumps({'type':'complete','version_id':new_version_id,'testcase':updated_testcase})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return gen()

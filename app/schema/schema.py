@@ -91,3 +91,7 @@ class SelectedIssuesModel(BaseModel):
     frd_id: int
     analysis_version_id: int
     anomalies: List[Anomaly]
+
+
+class TestCaseChatRequest(BaseModel):
+    message: str
