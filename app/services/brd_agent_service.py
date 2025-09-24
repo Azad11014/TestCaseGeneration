@@ -153,20 +153,22 @@ class BRDAgentService:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"BRD->FRD conversion failed: {e}")
 
-    async def _get_frd_from_brd(self, db: AsyncSession, brd_id: int):
-        mapping = await db.execute(
+    async def _get_frd_from_brd(self, db: AsyncSession, brd_id: int) -> Documents:
+        result = await db.execute(
             select(BRDToFRDVersions)
             .where(BRDToFRDVersions.brd_id == brd_id)
             .order_by(BRDToFRDVersions.id.desc())
         )
-        mapping = mapping.scalars().first()
+        mapping = result.scalars().first()
         if not mapping:
             raise HTTPException(status_code=404, detail="No FRD found for this BRD")
 
         frd_doc = await db.get(Documents, mapping.frd_id)
         if not frd_doc:
             raise HTTPException(status_code=404, detail="FRD document referenced by mapping not found")
+
         return frd_doc
+
     # --------------------------
     # Get latest FRD for a BRD
     # --------------------------
@@ -187,28 +189,25 @@ class BRDAgentService:
     # Analyze FRD
     # --------------------------
     async def analyze_brd_frd(self, db: AsyncSession, brd_id: int) -> Dict[str, Any]:
-        # Fetch the corresponding FRD document from the BRD
-        frd_doc = await self._get_frd_from_brd(db, brd_id)
-        
-        # Perform analysis via FRD agent
+        try:
+            frd_doc = await self._get_frd_from_brd(db, brd_id)
+        except HTTPException as e:
+            if e.status_code == 404:
+                # Auto-convert missing BRD → FRD
+                await self.brd_to_frd(db, brd_id)
+                frd_doc = await self._get_frd_from_brd(db, brd_id)
+            else:
+                raise
+
         result = await self.frd_agent.analyze_frd_mapreduce(db, frd_doc.id)
         anomalies = result.get("anomalies", result)
-
-        # Safely get status; fallback to 'draft' if not present
-        status_value = getattr(frd_doc, "status", None)
-        status = getattr(status_value, "value", status_value) if status_value else "draft"
-
-        # Safely get active version ID if available
-        active_version_id = getattr(frd_doc, "active_version_id", None)
-
         return {
             "message": f"Analyzed FRD {frd_doc.id} for BRD {brd_id}",
             "frd_id": frd_doc.id,
-            "frd_version_id": active_version_id,
             "anomalies": anomalies,
-            "status": status,
             "file_path": frd_doc.file_path,
         }
+
 
     async def propose_fix_to_btf(
     self,
@@ -241,7 +240,7 @@ class BRDAgentService:
             raise HTTPException(status_code=400, detail="Selected issues not found in FRD anomalies")
 
         # Use existing propose_fixes logic
-        return await self.propose_fixes(db, frd_doc.id, selected_issues)
+        return await self.frd_agent.propose_fixes(db, frd_doc.id, selected_issues)
 
 
     # --------------------------
@@ -353,22 +352,6 @@ class BRDAgentService:
             "applied_fixes": applied_fixes
         }
 
-
-
-    async def _get_frd_from_brd(self, db: AsyncSession, brd_id: int) -> Documents:
-        """
-        Helper to get FRD document corresponding to a BRD.
-        Assumes FRD is generated for the BRD and exists in `Documents` table.
-        """
-        result = await db.execute(
-            select(Documents)
-            .where(Documents.project_id == brd_id, Documents.doctype == "FRD")
-            .limit(1)
-        )
-        frd_doc = result.scalar_one_or_none()
-        if not frd_doc:
-            raise HTTPException(status_code=404, detail="No FRD document found for this BRD")
-        return frd_doc
 
     # --------------------------
     # Revert FRD to previous BRD->FRD mapping
@@ -540,9 +523,19 @@ class BRDAgentService:
 
     # ---------- Analyze BRD (via FRD) ----------
     async def stream_analyze_brd_frd(self, db: AsyncSession, brd_id: int):
-        frd_doc = await self._get_frd_from_brd(db, brd_id)
-        # This already returns a generator from frd_agent:
+        try:
+            frd_doc = await self._get_frd_from_brd(db, brd_id)
+        except HTTPException as e:
+            if e.status_code == 404:
+                # Auto-convert BRD → FRD if missing
+                await self.brd_to_frd(db, brd_id)
+                frd_doc = await self._get_frd_from_brd(db, brd_id)
+            else:
+                raise
+
+        # Now return the async generator from frd_agent
         return await self.frd_agent.analyze_frd_mapreduce_stream(db, frd_doc.id)
+
 
 
     # ---------- Propose fixes ----------

@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import selectinload
 
 
+
 from app.models.models import Documents, Projects, Testcases
 from app.schema.schema import ProjectCreate
 
@@ -12,33 +13,31 @@ class ProjectService:
     @staticmethod
     async def create_project(db: AsyncSession, project: ProjectCreate):
         try:
-            # check if project already exists
-            result = await db.execute(
+            # check duplicate
+            res = await db.execute(
                 select(Projects).where(func.lower(Projects.name) == project.name.lower())
             )
-            existing = result.scalar_one_or_none()
-            if existing:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Project '{project.name}' already exists"
-                )
+            if res.scalar_one_or_none():
+                raise HTTPException(status_code=403, detail=f"Project '{project.name}' already exists")
 
-            new_project = Projects(
-                name=project.name,
-                description=project.description
-            )
+            new_project = Projects(name=project.name, description=project.description)
             db.add(new_project)
-            await db.commit()         # persist
-            await db.refresh(new_project)  # load auto-generated fields
+            await db.commit()
+            await db.refresh(new_project)
 
-            return new_project
+            # Re-fetch with documents eagerly loaded (if ProjectRead includes them)
+            result = await db.execute(
+                select(Projects)
+                .options(selectinload(Projects.documents))
+                .where(Projects.id == new_project.id)
+            )
+            return result.scalar_one()
 
         except HTTPException:
             raise
         except Exception as e:
             await db.rollback()
-            raise HTTPException(status_code=500, detail=f"Something broke: {e}")
-
+            raise HTTPException(status_code=500, detail=str(e))
 
     @staticmethod
     async def list_projects(db: AsyncSession):

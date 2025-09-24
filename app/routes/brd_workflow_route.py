@@ -94,7 +94,7 @@ async def generate_testcases(
     document_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    return await brd_agent.generate(db, document_id)
+    return await brd_agent.generate_testcases(db, document_id)
 
 
 # ------------------------
