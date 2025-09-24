@@ -12,31 +12,33 @@ class ProjectService:
     @staticmethod
     async def create_project(db: AsyncSession, project: ProjectCreate):
         try:
-            # Check if project already exists
-            db_project = await db.execute(
+            # check if project already exists
+            result = await db.execute(
                 select(Projects).where(func.lower(Projects.name) == project.name.lower())
             )
-            project_exists = db_project.scalar_one_or_none()
-            if project_exists:
+            existing = result.scalar_one_or_none()
+            if existing:
                 raise HTTPException(
                     status_code=403,
-                    detail=f"Project '{str(project.name)}' already exists"
+                    detail=f"Project '{project.name}' already exists"
                 )
-            
+
             new_project = Projects(
                 name=project.name,
                 description=project.description
             )
             db.add(new_project)
-            await db.commit()
-            await db.refresh(new_project)
+            await db.commit()         # persist
+            await db.refresh(new_project)  # load auto-generated fields
 
             return new_project
+
         except HTTPException:
             raise
         except Exception as e:
             await db.rollback()
             raise HTTPException(status_code=500, detail=f"Something broke: {e}")
+
 
     @staticmethod
     async def list_projects(db: AsyncSession):
