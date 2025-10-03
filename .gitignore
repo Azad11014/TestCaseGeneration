@@ -1,0 +1,7 @@
+__pycache__
+.atenv
+.env
+tests
+logs
+chroma_store
+data
