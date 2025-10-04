@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes.project_routes import project_router
 from app.routes.upload_router import upload_router
 from app.routes.text_extraction_route import extraction_router
+from app.routes.frd_router import frd_router
 
 from logs.logger_config  import get_logger
 from colorama import Fore, Style, init
@@ -82,5 +83,5 @@ def create_app():
     app.include_router(project_router, prefix=f"{api_prefix}/project", tags=["Project"])
     app.include_router(upload_router, prefix=f"{api_prefix}/project", tags=["Document Upload"])
     app.include_router(extraction_router, prefix=f"{api_prefix}/project", tags=["Text Extraction"])
-    
+    app.include_router(frd_router, prefix=f"{api_prefix}/frd", tags=["FRD Operations"])
     return app
